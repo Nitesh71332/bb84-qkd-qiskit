@@ -10,7 +10,7 @@ A Qiskit simulation of the **BB84 quantum key distribution protocol**. It measur
 |---|---|
 | C. Nitesh Kumar (Leader) | 2024BCS0270 |
 | J. Nandan | 2024BCS0190 |
-| R. Mourya Reddy | 2024BCS0307 |
+| R. Mourya Vardhan Reddy | 2024BCS0307 |
 | Himanshu | 2024BCS0286 |
 | S. Sameer Basha | 2024BCS0290 |
 
