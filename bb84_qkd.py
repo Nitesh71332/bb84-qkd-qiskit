@@ -1,352 +1,452 @@
 """
-bb84_qkd.py
-===========
-Performance Analysis of BB84 Quantum Key Distribution under Noise and
-Eavesdropping using Qiskit.
+BB84 Quantum Key Distribution simulation under channel noise and eavesdropping.
 
-IEG 313: Quantum Computing for Engineers - Team "Bell State Bandits", IIIT Kottayam
-
-WHAT THIS FILE DOES (big picture)
----------------------------------
-Alice and Bob want a shared secret key. BB84 builds it from qubits:
-
-    1. Alice picks random bits + random bases and sends qubits.
-    2. Bob measures each qubit in a random basis.
-    3. SIFTING: they publicly compare bases (never bits) and keep matches.
-    4. QBER ESTIMATION: they compare a random sample of the kept bits.
-       The fraction that differs is the Quantum Bit Error Rate (QBER).
-    5. DETECTOR: QBER <= 11%  -> ACCEPT key,   QBER > 11% -> REJECT key.
-
-We simulate two things that raise the QBER:
-    * Eve, an eavesdropper doing an intercept-resend attack (~25% QBER)
-    * Channel noise (depolarizing), 0% - 20%
-
-FILE LAYOUT
------------
-    0. Configuration
-    1. Quantum building blocks   (noisy backend, one-qubit circuit, transmit)
-    2. The BB84 protocol         (run_bb84, one step per commented block)
-    3. Experiments               (noise sweep, Eve-fraction sweep)
-    4. Plots
-    5. Command-line entry point
-
-Basis encoding used everywhere:  0 = Z basis (|0>,|1>),  1 = X basis (|+>,|->)
+Educational Qiskit/Aer simulation. This is not production QKD: it does not
+implement authenticated classical communication, error reconciliation, or
+privacy amplification. The 11% decision threshold is illustrative, not a
+universal security guarantee.
 """
+
 import argparse
 import os
+from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-
 from qiskit import QuantumCircuit, transpile
 from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel, depolarizing_error
 
-# ----------------------------------------------------------------------------
-# 0. CONFIGURATION
-# ----------------------------------------------------------------------------
-N_QUBITS = 2000          # qubits Alice sends per run
-SAMPLE_FRAC = 0.25       # fraction of the sifted key publicly revealed to estimate QBER
-QBER_THRESHOLD = 0.11    # accept key if estimated QBER <= 11% (standard BB84 bound)
-NOISE_LEVELS = [0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.14, 0.16, 0.18, 0.20]
-TRIALS = 5               # runs averaged per (noise, Eve) setting
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+N_QUBITS = 10_000
+SAMPLE_FRAC = 0.25
+QBER_THRESHOLD = 0.11  # Illustrative threshold only
+NOISE_LEVELS = [i / 100 for i in range(0, 21, 2)]
+TRIALS = 10
 RESULTS_DIR = "results"
+EVE_FRACTIONS = [i / 10 for i in range(11)]
 
 rng = np.random.default_rng()
 
 
-def set_seed(seed):
-    """Make a run reproducible (same random bits/bases every time)."""
+def set_seed(seed: Optional[int]) -> None:
+    """Set random seed for reproducible classical choices."""
     global rng
     rng = np.random.default_rng(seed)
 
 
-# ----------------------------------------------------------------------------
-# 1. QUANTUM BUILDING BLOCKS
-# ----------------------------------------------------------------------------
-def make_backend(noise):
-    """
-    Build the Qiskit Aer simulator.
+def validate_inputs(n: int, noise: float, eve_fraction: float) -> None:
+    """Validate one BB84 simulation's parameters."""
+    if not isinstance(n, (int, np.integer)) or n < 10:
+        raise ValueError("n must be an integer >= 10.")
+    if not np.isfinite(noise) or not 0.0 <= noise <= 0.20:
+        raise ValueError("noise must be between 0.0 and 0.20.")
+    if not np.isfinite(eve_fraction) or not 0.0 <= eve_fraction <= 1.0:
+        raise ValueError("eve_fraction must be between 0.0 and 1.0.")
 
-    Channel noise is modelled as a depolarizing error on the 'id' (identity)
-    gate, which our circuit applies once while the qubit is "in the channel".
-    A depolarizing error with parameter lam flips the measured bit with
-    probability lam/2, so we pass lam = 2*noise: then `noise` is directly the
-    probability that the channel flips the qubit (e.g. noise=0.05 -> ~5% flips).
-    """
+
+def validate_experiment(trials: int, n: int) -> None:
+    if not isinstance(trials, int) or trials < 1:
+        raise ValueError("trials must be an integer >= 1.")
+    if not isinstance(n, int) or n < 10:
+        raise ValueError("n must be an integer >= 10.")
+
+
+def make_backend(noise: float) -> AerSimulator:
+    """Build Aer backend with depolarizing error on the channel marker gate."""
     noise_model = None
     if noise > 0:
         noise_model = NoiseModel()
-        err = depolarizing_error(min(2 * noise, 1.0), 1)
-        noise_model.add_all_qubit_quantum_error(err, ["id"])
+        error = depolarizing_error(min(2 * noise, 1.0), 1)
+        noise_model.add_all_qubit_quantum_error(error, ["id"])
     return AerSimulator(noise_model=noise_model)
 
 
-def build_circuit(bit, prep_basis, meas_basis, noisy):
-    """
-    Circuit for ONE qubit's journey:  prepare -> channel -> measure.
-
-    PREPARE (the sender)
-        bit = 1          -> X gate        : |0> becomes |1>
-        prep_basis = X   -> H gate        : moves the state into the X basis
-        Result: Z basis gives |0>,|1>;  X basis gives |+>,|->.
-    CHANNEL
-        id gate (this is where Aer injects the depolarizing noise)
-    MEASURE (the receiver)
-        meas_basis = X   -> H gate first  : rotates X basis back to Z
-        then measure in Z (all hardware measures in Z).
-    If meas_basis == prep_basis the result is exactly `bit` (without noise);
-    if they differ the result is a random 0/1.
-    """
-    qc = QuantumCircuit(1, 1)
+def build_circuit(bit: int, prep_basis: int, meas_basis: int, noisy: bool) -> QuantumCircuit:
+    """Prepare, transmit, and measure one BB84 qubit."""
+    circuit = QuantumCircuit(1, 1)
     if bit:
-        qc.x(0)
-    if prep_basis:
-        qc.h(0)
-    qc.barrier()
+        circuit.x(0)
+    if prep_basis:  # X basis
+        circuit.h(0)
+    circuit.barrier()
     if noisy:
-        qc.id(0)
-    qc.barrier()
-    if meas_basis:
-        qc.h(0)
-    qc.measure(0, 0)
-    return qc
+        circuit.id(0)
+    circuit.barrier()
+    if meas_basis:  # rotate X-basis measurement to Z basis
+        circuit.h(0)
+    circuit.measure(0, 0)
+    return circuit
 
 
-def transmit(bits, prep_bases, meas_bases, backend, noisy):
-    """
-    Send many qubits through Qiskit and return what was measured.
-
-    Every qubit's circuit depends only on (bit, prep_basis, meas_basis), so
-    there are just 8 distinct circuits. We run each one ONCE with
-    shots = (number of qubits needing it) instead of building 2000 circuits.
-    memory=True returns the individual shot results, so each qubit still gets
-    its own independent random measurement outcome.
-    """
+def transmit(bits, prep_bases, meas_bases, backend, noisy: bool) -> np.ndarray:
+    """Simulate qubits grouped into the eight possible circuit types."""
+    bits = np.asarray(bits, dtype=int)
+    prep_bases = np.asarray(prep_bases, dtype=int)
+    meas_bases = np.asarray(meas_bases, dtype=int)
     out = np.zeros(len(bits), dtype=int)
-    keys = bits * 4 + prep_bases * 2 + meas_bases       # unique id per circuit type
-    for k in np.unique(keys):
-        idx = np.where(keys == k)[0]                    # qubits using this circuit
-        b, pb, mb = (k >> 2) & 1, (k >> 1) & 1, k & 1
-        qc = transpile(build_circuit(b, pb, mb, noisy), backend, optimization_level=0)
-        shots = backend.run(qc, shots=len(idx), memory=True).result().get_memory()
-        out[idx] = np.array([int(s) for s in shots])
+    if len(bits) == 0:
+        return out
+
+    keys = bits * 4 + prep_bases * 2 + meas_bases
+    for key in np.unique(keys):
+        indices = np.where(keys == key)[0]
+        bit = (int(key) >> 2) & 1
+        prep_basis = (int(key) >> 1) & 1
+        meas_basis = int(key) & 1
+        circuit = transpile(
+            build_circuit(bit, prep_basis, meas_basis, noisy),
+            backend,
+            optimization_level=0,
+        )
+        memory = backend.run(
+            circuit, shots=len(indices), memory=True
+        ).result().get_memory()
+        out[indices] = np.array([int(value) for value in memory], dtype=int)
     return out
 
 
-# ----------------------------------------------------------------------------
-# 2. THE BB84 PROTOCOL
-# ----------------------------------------------------------------------------
-def run_bb84(n=N_QUBITS, noise=0.0, eve=False, eve_fraction=1.0, verbose=False):
-    """
-    One complete BB84 run. Returns a dict of measured quantities.
+def wilson_interval(errors: int, sample_size: int, z: float = 1.96):
+    """Approximate 95% Wilson interval for a binomial proportion."""
+    if sample_size <= 0:
+        return float("nan"), float("nan")
+    p = errors / sample_size
+    denominator = 1 + z**2 / sample_size
+    center = (p + z**2 / (2 * sample_size)) / denominator
+    margin = (
+        z
+        * np.sqrt(p * (1 - p) / sample_size + z**2 / (4 * sample_size**2))
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
 
-    n             : number of qubits Alice sends
-    noise         : channel noise level (0 - 0.2), probability of a flip
-    eve           : is an eavesdropper present?
-    eve_fraction  : share of qubits Eve intercepts (1.0 = all of them)
+
+def run_bb84(
+    n: int = N_QUBITS,
+    noise: float = 0.0,
+    eve: bool = False,
+    eve_fraction: float = 1.0,
+    verbose: bool = False,
+) -> dict:
     """
+    Run one BB84 simulation.
+
+    qber_est is estimated from the publicly revealed sample.
+    qber_true is simulator-only and uses all sifted bits; it is not available
+    to Alice and Bob in a real protocol.
+    """
+    validate_inputs(n, noise, eve_fraction)
     backend = make_backend(noise)
     noisy = noise > 0
 
-    # ---- STEP 1: Alice's random bits and random bases ---------------------
-    a_bits = rng.integers(0, 2, n)      # the secret bits she wants to share
-    a_bases = rng.integers(0, 2, n)     # 0 = Z, 1 = X : how she encodes each bit
+    alice_bits = rng.integers(0, 2, n)
+    alice_bases = rng.integers(0, 2, n)
+    bob_bases = rng.integers(0, 2, n)
 
-    # ---- STEP 2: Bob's random measurement bases ---------------------------
-    b_bases = rng.integers(0, 2, n)
-
-    # ---- STEP 3: quantum transmission -------------------------------------
-    if not eve:
-        # Alice -> Bob directly.
-        b_bits = transmit(a_bits, a_bases, b_bases, backend, noisy)
+    if not eve or eve_fraction == 0:
+        bob_bits = transmit(alice_bits, alice_bases, bob_bases, backend, noisy)
     else:
-        # Eve intercepts a random subset of the qubits (all of them by default).
-        hit = rng.random(n) < eve_fraction
-        b_bits = np.zeros(n, dtype=int)
+        intercepted = rng.random(n) < eve_fraction
+        bob_bits = np.zeros(n, dtype=int)
+        untouched = ~intercepted
+        bob_bits[untouched] = transmit(
+            alice_bits[untouched],
+            alice_bases[untouched],
+            bob_bases[untouched],
+            backend,
+            noisy,
+        )
 
-        # (a) qubits Eve does NOT touch: Alice -> Bob directly
-        free = ~hit
-        b_bits[free] = transmit(a_bits[free], a_bases[free], b_bases[free], backend, noisy)
+        eve_bases = rng.integers(0, 2, n)
+        # Eve measures Alice's qubit. The noisy channel is applied on Alice->Eve.
+        eve_bits = transmit(
+            alice_bits[intercepted],
+            alice_bases[intercepted],
+            eve_bases[intercepted],
+            backend,
+            noisy,
+        )
+        # Eve resends a freshly prepared qubit; channel noise also affects Eve->Bob.
+        bob_bits[intercepted] = transmit(
+            eve_bits,
+            eve_bases[intercepted],
+            bob_bases[intercepted],
+            backend,
+            noisy,
+        )
 
-        # (b) qubits Eve intercepts (intercept-resend attack):
-        #     Eve guesses a random basis and MEASURES (she cannot copy a qubit:
-        #     no-cloning theorem). Wrong basis -> her result is random and the
-        #     qubit is disturbed. She then RE-PREPARES a new qubit with the bit
-        #     she read, in the basis she used, and sends it to Bob.
-        e_bases = rng.integers(0, 2, n)
-        e_bits = transmit(a_bits[hit], a_bases[hit], e_bases[hit], backend, noisy=False)
-        b_bits[hit] = transmit(e_bits, e_bases[hit], b_bases[hit], backend, noisy)
+    keep = alice_bases == bob_bases
+    alice_sifted = alice_bits[keep]
+    bob_sifted = bob_bits[keep]
+    sifted_len = len(alice_sifted)
 
-    # ---- STEP 4: SIFTING --------------------------------------------------
-    # Over the public channel they announce BASES only. Keep positions where
-    # the bases match; there Bob's bit should equal Alice's. Others are random.
-    keep = a_bases == b_bases
-    a_sift, b_sift = a_bits[keep], b_bits[keep]
-    sifted_len = len(a_sift)
+    if sifted_len == 0:
+        result = {
+            "noise": noise,
+            "eve": bool(eve and eve_fraction > 0),
+            "eve_fraction": eve_fraction if eve else 0.0,
+            "sifted": 0,
+            "sample_size": 0,
+            "qber_est": float("nan"),
+            "qber_ci_low": float("nan"),
+            "qber_ci_high": float("nan"),
+            "qber_true": float("nan"),
+            "agreement": float("nan"),
+            "candidate_key_len": 0,
+            "accepted_key_len": 0,
+            "accepted": False,
+        }
+        if verbose:
+            print("No sifted bits were available; run rejected.")
+        return result
 
-    # ---- STEP 5: QBER ESTIMATION ------------------------------------------
-    # Reveal a random sample of the sifted bits and count mismatches.
-    # Those revealed bits are public now, so they are discarded.
-    sample_size = max(1, int(SAMPLE_FRAC * sifted_len))
-    sample_idx = rng.choice(sifted_len, sample_size, replace=False)
-    in_sample = np.zeros(sifted_len, dtype=bool)
-    in_sample[sample_idx] = True
-    qber_est = float(np.mean(a_sift[in_sample] != b_sift[in_sample]))   # what Alice & Bob see
-    qber_true = float(np.mean(a_sift != b_sift))                        # over the whole sifted key
+    sample_size = min(sifted_len, max(1, int(SAMPLE_FRAC * sifted_len)))
+    sample_indices = rng.choice(sifted_len, sample_size, replace=False)
+    sample_mask = np.zeros(sifted_len, dtype=bool)
+    sample_mask[sample_indices] = True
+    sample_errors = int(np.count_nonzero(
+        alice_sifted[sample_mask] != bob_sifted[sample_mask]
+    ))
+    qber_est = sample_errors / sample_size
+    ci_low, ci_high = wilson_interval(sample_errors, sample_size)
+    qber_true = float(np.mean(alice_sifted != bob_sifted))
 
-    # ---- STEP 6: THRESHOLD DETECTOR ---------------------------------------
-    accepted = qber_est <= QBER_THRESHOLD
+    alice_key = alice_sifted[~sample_mask]
+    bob_key = bob_sifted[~sample_mask]
+    agreement = float(np.mean(alice_key == bob_key)) if len(alice_key) else float("nan")
+    accepted = bool(qber_est <= QBER_THRESHOLD)
+    candidate_key_len = len(alice_key)
+    accepted_key_len = candidate_key_len if accepted else 0
 
-    # ---- STEP 7: FINAL KEY ------------------------------------------------
-    # Remaining (unrevealed) sifted bits. Used only if the key is accepted.
-    a_key, b_key = a_sift[~in_sample], b_sift[~in_sample]
-    agreement = float(np.mean(a_key == b_key)) if len(a_key) else float("nan")
+    result = {
+        "noise": noise,
+        "eve": bool(eve and eve_fraction > 0),
+        "eve_fraction": eve_fraction if eve else 0.0,
+        "sifted": sifted_len,
+        "sample_size": sample_size,
+        "qber_est": qber_est,
+        "qber_ci_low": ci_low,
+        "qber_ci_high": ci_high,
+        "qber_true": qber_true,
+        "agreement": agreement,
+        "candidate_key_len": candidate_key_len,
+        "accepted_key_len": accepted_key_len,
+        "accepted": accepted,
+    }
 
     if verbose:
-        _print_report(n, a_bits, a_bases, b_bases, b_bits, sifted_len, sample_size,
-                      qber_est, agreement, len(a_key), accepted, noise, eve, eve_fraction)
+        print(f"Settings              : noise={noise:.1%}, Eve={'ON' if result['eve'] else 'OFF'}")
+        print(f"Qubits sent           : {n}")
+        print(f"Sifted bits           : {sifted_len}")
+        print(f"Sample revealed       : {sample_size}")
+        print(f"Estimated QBER        : {qber_est:.2%}")
+        print(f"Approx. 95% QBER CI   : [{ci_low:.2%}, {ci_high:.2%}]")
+        print(f"Simulator-only QBER   : {qber_true:.2%}")
+        print(f"Remaining candidate bits: {candidate_key_len}")
+        print(f"Accepted key length   : {accepted_key_len}")
+        print(f"Decision              : {'ACCEPT' if accepted else 'REJECT'}")
+        print("Note: accepted length is a teaching metric, not a secure final key.")
 
-    return dict(noise=noise, eve=eve, eve_fraction=eve_fraction, sifted=sifted_len,
-                qber_est=qber_est, qber_true=qber_true, agreement=agreement,
-                raw_final_len=len(a_key), final_len=len(a_key) if accepted else 0,
-                accepted=accepted)
-
-
-def _print_report(n, a_bits, a_bases, b_bases, b_bits, sifted, sample, qber, agree,
-                  final_len, accepted, noise, eve, eve_fraction):
-    """Human-readable summary of one run (used for demos)."""
-    name = {0: "Z", 1: "X"}
-    print(f"Settings            : noise={noise:.0%}, Eve={'ON (intercepts %d%%)' % (eve_fraction*100) if eve else 'OFF'}")
-    print("First 10 qubits     :")
-    print("   #  Alice bit  A-basis  B-basis  Bob bit  match?")
-    for i in range(10):
-        m = "yes" if a_bases[i] == b_bases[i] else "no "
-        print(f"  {i+1:2d}      {a_bits[i]}         {name[a_bases[i]]}        {name[b_bases[i]]}       {b_bits[i]}      {m}")
-    print(f"Qubits sent         : {n}")
-    print(f"Sifted key length   : {sifted}   (bases matched)")
-    print(f"Sample revealed     : {sample}")
-    print(f"Estimated QBER      : {qber:.2%}")
-    print(f"Key agreement       : {agree:.2%}")
-    print(f"Final key length    : {final_len}")
-    print(f"Decision            : {'ACCEPT' if accepted else 'REJECT (disturbance detected)'}\n")
+    return result
 
 
-# ----------------------------------------------------------------------------
-# 3. EXPERIMENTS
-# ----------------------------------------------------------------------------
-def noise_experiment(trials=TRIALS, n=N_QUBITS):
-    """Main experiment: sweep noise 0-20%, with and without Eve, average trials."""
+def noise_experiment(trials: int = TRIALS, n: int = N_QUBITS) -> pd.DataFrame:
+    """Sweep channel noise with and without Eve, averaging repeated trials."""
+    validate_experiment(trials, n)
     rows = []
     for eve in (False, True):
-        for p in NOISE_LEVELS:
+        for noise in NOISE_LEVELS:
             for _ in range(trials):
-                rows.append(run_bb84(n=n, noise=p, eve=eve))
-            print(f"  done: Eve={'ON ' if eve else 'OFF'} noise={p:.0%}")
+                rows.append(run_bb84(n=n, noise=noise, eve=eve))
+            print(f"Completed: Eve={'ON' if eve else 'OFF'}, noise={noise:.0%}")
+
     raw = pd.DataFrame(rows)
-    summary = (raw.groupby(["eve", "noise"])
-                  .agg(QBER=("qber_true", "mean"), QBER_std=("qber_true", "std"),
-                       agreement=("agreement", "mean"), sifted=("sifted", "mean"),
-                       final_key_len=("raw_final_len", "mean"),
-                       accept_rate=("accepted", "mean"))
-                  .reset_index())
-    summary["eve"] = summary["eve"].map({False: "No Eve", True: "Eve (intercept-resend)"})
+    summary = (
+        raw.groupby(["eve", "noise"], dropna=False)
+        .agg(
+            estimated_qber=("qber_est", "mean"),
+            estimated_qber_std=("qber_est", "std"),
+            simulator_true_qber=("qber_true", "mean"),
+            simulator_true_qber_std=("qber_true", "std"),
+            mean_sifted_bits=("sifted", "mean"),
+            mean_sample_size=("sample_size", "mean"),
+            mean_key_agreement=("agreement", "mean"),
+            mean_candidate_key_len=("candidate_key_len", "mean"),
+            mean_accepted_key_len=("accepted_key_len", "mean"),
+            acceptance_rate=("accepted", "mean"),
+        )
+        .reset_index()
+    )
+    summary["eve_label"] = summary["eve"].map(
+        {False: "No Eve", True: "Eve (intercept-resend)"}
+    )
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    raw.to_csv(f"{RESULTS_DIR}/raw_results.csv", index=False)
-    summary.to_csv(f"{RESULTS_DIR}/summary.csv", index=False)
+    raw.to_csv(os.path.join(RESULTS_DIR, "raw_results.csv"), index=False)
+    summary.to_csv(os.path.join(RESULTS_DIR, "summary.csv"), index=False)
     return summary
 
 
-def eve_fraction_experiment(trials=TRIALS, n=N_QUBITS):
-    """Extension: Eve intercepts only a fraction f of the qubits (no noise).
-    Theory: QBER ~ 25% * f, so a careful Eve can stay under the threshold."""
-    fractions = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+def eve_fraction_experiment(
+    trials: int = TRIALS, n: int = N_QUBITS
+) -> pd.DataFrame:
+    """Sweep the fraction intercepted by Eve with no channel noise."""
+    validate_experiment(trials, n)
     rows = []
-    for f in fractions:
+    for fraction in EVE_FRACTIONS:
         for _ in range(trials):
-            rows.append(run_bb84(n=n, noise=0.0, eve=f > 0, eve_fraction=f))
-        print(f"  done: Eve intercepts {f:.0%}")
-    df = pd.DataFrame(rows)
-    out = (df.groupby("eve_fraction")
-             .agg(QBER=("qber_true", "mean"), accept_rate=("accepted", "mean"))
-             .reset_index())
+            rows.append(
+                run_bb84(
+                    n=n,
+                    noise=0.0,
+                    eve=fraction > 0,
+                    eve_fraction=fraction,
+                )
+            )
+        print(f"Completed: Eve intercepts {fraction:.0%}")
+
+    raw = pd.DataFrame(rows)
+    summary = (
+        raw.groupby("eve_fraction")
+        .agg(
+            estimated_qber=("qber_est", "mean"),
+            simulator_true_qber=("qber_true", "mean"),
+            mean_accepted_key_len=("accepted_key_len", "mean"),
+            acceptance_rate=("accepted", "mean"),
+        )
+        .reset_index()
+    )
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    out.to_csv(f"{RESULTS_DIR}/eve_fraction.csv", index=False)
-    return out
+    raw.to_csv(os.path.join(RESULTS_DIR, "eve_fraction_raw.csv"), index=False)
+    summary.to_csv(os.path.join(RESULTS_DIR, "eve_fraction.csv"), index=False)
+    return summary
 
 
-# ----------------------------------------------------------------------------
-# 4. PLOTS
-# ----------------------------------------------------------------------------
-COLORS = {"No Eve": "tab:blue", "Eve (intercept-resend)": "tab:red"}
-
-
-def _finish(fname, show):
+def finish_plot(filename: str, show: bool) -> None:
     plt.tight_layout()
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    plt.savefig(f"{RESULTS_DIR}/{fname}", dpi=200)
-    plt.show() if show else plt.close()
+    plt.savefig(os.path.join(RESULTS_DIR, filename), dpi=200)
+    if show:
+        plt.show()
+    else:
+        plt.close()
 
 
-def plot_noise_results(summary, show=False):
-    """4 graphs: QBER, key agreement, final key length, detector acceptance."""
-    # QBER vs noise (with the 11% threshold line)
-    plt.figure(figsize=(6, 4))
-    for name, g in summary.groupby("eve"):
-        plt.errorbar(g.noise * 100, g.QBER * 100, yerr=g.QBER_std * 100,
-                     marker="o", capsize=3, label=name, color=COLORS[name])
-    plt.axhline(QBER_THRESHOLD * 100, ls="--", color="k", label="11% threshold")
-    plt.xlabel("Channel noise (%)"); plt.ylabel("QBER (%)")
-    plt.title("QBER vs channel noise"); plt.legend(); plt.grid(alpha=.3)
-    _finish("qber_vs_noise.png", show)
+def plot_noise_results(summary: pd.DataFrame, show: bool = False) -> None:
+    """Create QBER, accepted-key length, and acceptance-rate plots."""
+    colors = {"No Eve": "tab:blue", "Eve (intercept-resend)": "tab:red"}
+    for label, group in summary.groupby("eve_label"):
+        group = group.sort_values("noise")
+        plt.plot(
+            group["noise"] * 100,
+            group["estimated_qber"] * 100,
+            marker="o",
+            label=label,
+            color=colors[label],
+        )
+    plt.axhline(QBER_THRESHOLD * 100, linestyle="--", color="black", label="Illustrative 11% threshold")
+    plt.xlabel("Channel noise (%)")
+    plt.ylabel("Estimated QBER (%)")
+    plt.title("Estimated QBER vs Channel Noise")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    finish_plot("qber_vs_noise.png", show)
 
-    for col, ylabel, title, fname, scale in [
-        ("agreement", "Key agreement (%)", "Key agreement vs channel noise", "key_agreement_vs_noise.png", 100),
-        ("final_key_len", "Final key length (bits)", "Final key length (after sifting + sampling)", "final_key_length.png", 1),
-        ("accept_rate", "Key accepted (%)", "Threshold detector: acceptance rate", "detector_accept_rate.png", 100),
+    for column, ylabel, title, filename, scale in [
+        ("mean_candidate_key_len", "Mean candidate key length (bits)", "Candidate Key Length vs Channel Noise", "candidate_key_length_vs_noise.png", 1),
+        ("mean_accepted_key_len", "Mean accepted key length (bits)", "Accepted Key Length vs Channel Noise", "accepted_key_length_vs_noise.png", 1),
+        ("acceptance_rate", "Acceptance rate (%)", "Key Acceptance Rate vs Channel Noise", "acceptance_rate_vs_noise.png", 100),
     ]:
-        plt.figure(figsize=(6, 4))
-        for name, g in summary.groupby("eve"):
-            plt.plot(g.noise * 100, g[col] * scale, marker="o", label=name, color=COLORS[name])
-        plt.xlabel("Channel noise (%)"); plt.ylabel(ylabel)
-        plt.title(title); plt.legend(); plt.grid(alpha=.3)
-        _finish(fname, show)
+        for label, group in summary.groupby("eve_label"):
+            group = group.sort_values("noise")
+            plt.plot(
+                group["noise"] * 100,
+                group[column] * scale,
+                marker="o",
+                label=label,
+                color=colors[label],
+            )
+        plt.xlabel("Channel noise (%)")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid(alpha=0.3)
+        plt.legend()
+        finish_plot(filename, show)
+
+    # Agreement among unrevealed candidate bits is a diagnostic metric only.
+    if "mean_key_agreement" in summary.columns:
+        for label, group in summary.groupby("eve_label"):
+            group = group.sort_values("noise")
+            plt.plot(
+                group["noise"] * 100,
+                group["mean_key_agreement"] * 100,
+                marker="o",
+                label=label,
+                color=colors[label],
+            )
+        plt.xlabel("Channel noise (%)")
+        plt.ylabel("Key agreement among candidate bits (%)")
+        plt.title("Candidate Key Agreement vs Channel Noise")
+        plt.grid(alpha=0.3)
+        plt.legend()
+        finish_plot("key_agreement_vs_noise.png", show)
 
 
-def plot_eve_fraction(df, show=False):
-    """QBER vs fraction of qubits Eve intercepts, with theory line 25% * f."""
-    plt.figure(figsize=(6, 4))
-    plt.plot(df.eve_fraction * 100, df.QBER * 100, "o-", color="tab:red", label="Simulated")
-    plt.plot(df.eve_fraction * 100, 25 * df.eve_fraction, "k:", label="Theory: 25% x fraction")
-    plt.axhline(QBER_THRESHOLD * 100, ls="--", color="gray", label="11% threshold")
-    plt.xlabel("Qubits intercepted by Eve (%)"); plt.ylabel("QBER (%)")
-    plt.title("Partial eavesdropping"); plt.legend(); plt.grid(alpha=.3)
-    _finish("qber_vs_eve_fraction.png", show)
+def plot_eve_fraction(summary: pd.DataFrame, show: bool = False) -> None:
+    plt.plot(
+        summary["eve_fraction"] * 100,
+        summary["simulator_true_qber"] * 100,
+        "o-",
+        label="Simulated QBER",
+    )
+    plt.plot(
+        summary["eve_fraction"] * 100,
+        25 * summary["eve_fraction"],
+        "k:",
+        label="Idealized theory: 25% × intercepted fraction",
+    )
+    plt.axhline(QBER_THRESHOLD * 100, linestyle="--", label="Illustrative 11% threshold")
+    plt.xlabel("Qubits intercepted by Eve (%)")
+    plt.ylabel("Simulator-only QBER (%)")
+    plt.title("QBER vs Partial Intercept-Resend Eavesdropping")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    finish_plot("qber_vs_eve_fraction.png", show)
 
 
-# ----------------------------------------------------------------------------
-# 5. COMMAND-LINE ENTRY POINT
-# ----------------------------------------------------------------------------
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="BB84 QKD simulation (Qiskit)")
-    ap.add_argument("--demo", action="store_true", help="single verbose run, with and without Eve")
-    ap.add_argument("--trials", type=int, default=TRIALS, help="runs averaged per setting")
-    ap.add_argument("--n", type=int, default=N_QUBITS, help="qubits Alice sends per run")
-    ap.add_argument("--seed", type=int, default=None, help="random seed for reproducibility")
-    args, _ = ap.parse_known_args()     # parse_known_args: also safe inside Jupyter
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Educational BB84 QKD simulation using Qiskit Aer")
+    parser.add_argument("--demo", action="store_true", help="run one demo with and without Eve")
+    parser.add_argument("--trials", type=int, default=TRIALS, help="trials averaged per setting")
+    parser.add_argument("--n", type=int, default=N_QUBITS, help="qubits sent per run")
+    parser.add_argument("--seed", type=int, default=None, help="random seed for reproducibility")
+    parser.add_argument("--no-show", action="store_true", help="save plots without opening windows")
+    args, _ = parser.parse_known_args()
 
-    if args.seed is not None:
-        set_seed(args.seed)
+    try:
+        validate_experiment(args.trials, args.n)
+    except ValueError as exc:
+        parser.error(str(exc))
+    set_seed(args.seed)
 
     if args.demo:
         run_bb84(n=args.n, noise=0.05, eve=False, verbose=True)
         run_bb84(n=args.n, noise=0.05, eve=True, verbose=True)
-    else:
-        print("Noise experiment...")
-        summary = noise_experiment(args.trials, args.n)
-        print(summary.round(3).to_string(index=False))
-        plot_noise_results(summary)
-        print("Eve-fraction experiment...")
-        plot_eve_fraction(eve_fraction_experiment(args.trials, args.n))
-        print(f"\nSaved CSVs and graphs to ./{RESULTS_DIR}/")
+        return
+
+    print("Running channel-noise experiment...")
+    noise_summary = noise_experiment(args.trials, args.n)
+    print(noise_summary.round(4).to_string(index=False))
+    plot_noise_results(noise_summary, show=not args.no_show)
+
+    print("Running partial-eavesdropping experiment...")
+    eve_summary = eve_fraction_experiment(args.trials, args.n)
+    print(eve_summary.round(4).to_string(index=False))
+    plot_eve_fraction(eve_summary, show=not args.no_show)
+    print(f"CSV files and plots saved in ./{RESULTS_DIR}/")
+
+
+if __name__ == "__main__":
+    main()
