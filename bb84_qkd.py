@@ -332,6 +332,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="BB84 QKD simulation (Qiskit)")
     ap.add_argument("--demo", action="store_true", help="single verbose run, with and without Eve")
     ap.add_argument("--trials", type=int, default=TRIALS, help="runs averaged per setting")
+    ap.add_argument("--n", type=int, default=N_QUBITS, help="qubits Alice sends per run")
     ap.add_argument("--seed", type=int, default=None, help="random seed for reproducibility")
     args, _ = ap.parse_known_args()     # parse_known_args: also safe inside Jupyter
 
@@ -339,13 +340,13 @@ if __name__ == "__main__":
         set_seed(args.seed)
 
     if args.demo:
-        run_bb84(noise=0.05, eve=False, verbose=True)
-        run_bb84(noise=0.05, eve=True, verbose=True)
+        run_bb84(n=args.n, noise=0.05, eve=False, verbose=True)
+        run_bb84(n=args.n, noise=0.05, eve=True, verbose=True)
     else:
         print("Noise experiment...")
-        summary = noise_experiment(args.trials)
+        summary = noise_experiment(args.trials, args.n)
         print(summary.round(3).to_string(index=False))
         plot_noise_results(summary)
         print("Eve-fraction experiment...")
-        plot_eve_fraction(eve_fraction_experiment(args.trials))
+        plot_eve_fraction(eve_fraction_experiment(args.trials, args.n))
         print(f"\nSaved CSVs and graphs to ./{RESULTS_DIR}/")
